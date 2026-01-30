@@ -213,7 +213,7 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
         throw std::runtime_error("Shape mismatch");
     }
     
-    size_t ndim_ = shape.size();
+    int ndim_ = shape.size();
     std::vector<ptrdiff_t> new_strides(ndim_);
     size_t new_stride = 1;
     for(int i = ndim_ - 1; i >= 0; i--){
