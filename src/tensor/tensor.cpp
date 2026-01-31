@@ -165,7 +165,7 @@ void Tensor::debug() const {
 
 bool Tensor::isContiguous() const {
     size_t accumulated = 1;
-    int ndim = this->shape().size();
+    int ndim = static_cast<int>(this->shape().size());
 
     for(int i = ndim - 1; i >= 0; i --){
         size_t cnt_stride = this->strides()[i];//当前实际步长
@@ -213,7 +213,7 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
         throw std::runtime_error("Shape mismatch");
     }
     
-    int ndim_ = shape.size();
+    int ndim_ = static_cast<int>(shape.size());
     std::vector<ptrdiff_t> new_strides(ndim_);
     size_t new_stride = 1;
     for(int i = ndim_ - 1; i >= 0; i--){
