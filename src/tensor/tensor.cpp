@@ -279,33 +279,9 @@ tensor_t Tensor::contiguous() const {
     return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
 }
 
-tensor_t Tensor::reshape(const std::vector<size_t> &new_shape) const {
-
-    size_t new_numel = 1;
-    for (size_t s : new_shape) {
-        new_numel *= s;
-    }
-
-    if (new_numel != this->numel()) {
-        std::cerr << "[ERROR] Reshape mismatch! Old: " << this->numel()
-                  << ", New: " << new_numel << std::endl;
-        throw std::runtime_error("Reshape numel mismatch");
-    }
-
-    TensorMeta new_meta;
-    new_meta.dtype = this->_meta.dtype;
-    new_meta.shape = new_shape;
-
-    new_meta.strides.resize(new_shape.size());
-    ptrdiff_t stride = 1;
-    for (int i = static_cast<int>(new_shape.size()) - 1; i >= 0; --i) {
-        new_meta.strides[i] = stride;
-        stride *= static_cast<ptrdiff_t>(new_shape[i]);
-    }
-
-    Tensor *raw_ptr = new Tensor(new_meta, this->_storage, this->_offset);
-
-    return tensor_t(raw_ptr);
+tensor_t Tensor::reshape(const std::vector<size_t>& shape) const {
+    
+    return this->view(shape);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
