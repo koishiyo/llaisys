@@ -167,10 +167,10 @@ bool Tensor::isContiguous() const {
     size_t accumulated = 1;
     int ndim = static_cast<int>(this->shape().size());
 
-    for(int i = ndim - 1; i >= 0; i --){
-        size_t cnt_stride = this->strides()[i];//当前实际步长
-        size_t cnt_shape = this->shape()[i];//当前维度的形状大小
-        if(cnt_stride != accumulated){
+    for (int i = ndim - 1; i >= 0; i--) {
+        size_t cnt_stride = this->strides()[i]; // 当前实际步长
+        size_t cnt_shape = this->shape()[i];    // 当前维度的形状大小
+        if (cnt_stride != accumulated) {
             return false;
         }
         accumulated *= cnt_shape;
@@ -179,8 +179,8 @@ bool Tensor::isContiguous() const {
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    
-    if(order.size() != this->ndim()){
+
+    if (order.size() != this->ndim()) {
         throw std::runtime_error("Permute order size mismatch");
     }
     std::vector<size_t> new_shape;
@@ -189,7 +189,7 @@ tensor_t Tensor::permute(const std::vector<size_t> &order) const {
     new_shape.reserve(this->ndim());
     new_strides.reserve(this->ndim());
 
-    for(size_t original_dim_index : order){
+    for (size_t original_dim_index : order) {
         new_shape.push_back(this->shape()[original_dim_index]);
         new_strides.push_back(this->strides()[original_dim_index]);
     }
@@ -200,27 +200,27 @@ tensor_t Tensor::permute(const std::vector<size_t> &order) const {
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    //检查连续
-    if(!this->isContiguous()){
+    // 检查连续
+    if (!this->isContiguous()) {
         throw std::runtime_error("View: tensors is not contiguous");
     }
-    //新形状元素总数
+    // 新形状元素总数
     size_t new_numel = 1;
-    for(size_t s : shape){
+    for (size_t s : shape) {
         new_numel *= s;
     }
-    if(new_numel != this->numel()){
+    if (new_numel != this->numel()) {
         throw std::runtime_error("Shape mismatch");
     }
-    
+
     int ndim_ = static_cast<int>(shape.size());
     std::vector<ptrdiff_t> new_strides(ndim_);
     size_t new_stride = 1;
-    for(int i = ndim_ - 1; i >= 0; i--){
+    for (int i = ndim_ - 1; i >= 0; i--) {
         new_strides[i] = new_stride;
         new_stride *= shape[i];
     }
-    //构建新元数据
+    // 构建新元数据
     TensorMeta meta{this->dtype(), shape, new_strides};
 
     return std::shared_ptr<Tensor>(new Tensor(std::move(meta), this->_storage, this->_offset));
@@ -247,7 +247,7 @@ tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
 
     std::vector<ptrdiff_t> new_strides = this->strides();
 
-    // 计算新的偏移量 
+    // 计算新的偏移量
     size_t skipped_elements = start * new_strides[dim];
     size_t shift_bytes = skipped_elements * this->elementSize();
     // 新的偏移量
@@ -258,21 +258,19 @@ tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
 }
 
 void Tensor::load(const void *src_) {
-    
 
-    size_t total_bytes = this->numel() * this->elementSize();//数据总大小
+    size_t total_bytes = this->numel() * this->elementSize(); // 数据总大小
     void *dst_ = this->data();
-    if(this->deviceType() == LLAISYS_DEVICE_CPU){
+    if (this->deviceType() == LLAISYS_DEVICE_CPU) {
         std::memcpy(dst_, src_, total_bytes);
-    }//目标在CPU上
-    else{
+    } // 目标在CPU上
+    else {
         core::context().setDevice(this->deviceType(), this->deviceId());
         core::context().runtime().api()->memcpy_sync(
-            dst_,//目标地址
-            src_,//源地址
+            dst_, // 目标地址
+            src_, // 源地址
             total_bytes,
-            LLAISYS_MEMCPY_H2D
-        );
+            LLAISYS_MEMCPY_H2D);
     }
 }
 
@@ -281,39 +279,32 @@ tensor_t Tensor::contiguous() const {
     return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
 }
 
-tensor_t Tensor::reshape(const std::vector<size_t>& new_shape) const {
-    // 1. 计算新元素总数
+tensor_t Tensor::reshape(const std::vector<size_t> &new_shape) const {
+
     size_t new_numel = 1;
     for (size_t s : new_shape) {
         new_numel *= s;
     }
 
-    // 2. 检查元素数量是否匹配
     if (new_numel != this->numel()) {
-        std::cerr << "[ERROR] Reshape mismatch! Old: " << this->numel() 
+        std::cerr << "[ERROR] Reshape mismatch! Old: " << this->numel()
                   << ", New: " << new_numel << std::endl;
         throw std::runtime_error("Reshape numel mismatch");
     }
 
-    // 3. 准备新的元数据 (Meta)
     TensorMeta new_meta;
-    new_meta.dtype = this->_meta.dtype;   // 复制 dtype
-    new_meta.shape = new_shape;           // 设置新 shape
-    
-    // 4. 重新计算 Stride (假设为连续内存 Row-Major)
-    // 注意：头文件中 strides 是 ptrdiff_t 类型
+    new_meta.dtype = this->_meta.dtype;
+    new_meta.shape = new_shape;
+
     new_meta.strides.resize(new_shape.size());
     ptrdiff_t stride = 1;
-    for (int i = new_shape.size() - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(new_shape.size()) - 1; i >= 0; --i) {
         new_meta.strides[i] = stride;
-        stride *= new_shape[i];
+        stride *= static_cast<ptrdiff_t>(new_shape[i]);
     }
 
-    // 5. 创建新 Tensor 对象 (共享 Storage)
-    // 因为构造函数 Tensor(...) 是 private 的，但 reshape 是成员函数，所以可以访问
-    // 我们直接 new 一个对象并交给 shared_ptr (tensor_t) 管理
-    Tensor* raw_ptr = new Tensor(new_meta, this->_storage, this->_offset);
-    
+    Tensor *raw_ptr = new Tensor(new_meta, this->_storage, this->_offset);
+
     return tensor_t(raw_ptr);
 }
 
