@@ -281,9 +281,40 @@ tensor_t Tensor::contiguous() const {
     return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
 }
 
-tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+tensor_t Tensor::reshape(const std::vector<size_t>& new_shape) const {
+    // 1. 计算新元素总数
+    size_t new_numel = 1;
+    for (size_t s : new_shape) {
+        new_numel *= s;
+    }
+
+    // 2. 检查元素数量是否匹配
+    if (new_numel != this->numel()) {
+        std::cerr << "[ERROR] Reshape mismatch! Old: " << this->numel() 
+                  << ", New: " << new_numel << std::endl;
+        throw std::runtime_error("Reshape numel mismatch");
+    }
+
+    // 3. 准备新的元数据 (Meta)
+    TensorMeta new_meta;
+    new_meta.dtype = this->_meta.dtype;   // 复制 dtype
+    new_meta.shape = new_shape;           // 设置新 shape
+    
+    // 4. 重新计算 Stride (假设为连续内存 Row-Major)
+    // 注意：头文件中 strides 是 ptrdiff_t 类型
+    new_meta.strides.resize(new_shape.size());
+    ptrdiff_t stride = 1;
+    for (int i = new_shape.size() - 1; i >= 0; --i) {
+        new_meta.strides[i] = stride;
+        stride *= new_shape[i];
+    }
+
+    // 5. 创建新 Tensor 对象 (共享 Storage)
+    // 因为构造函数 Tensor(...) 是 private 的，但 reshape 是成员函数，所以可以访问
+    // 我们直接 new 一个对象并交给 shared_ptr (tensor_t) 管理
+    Tensor* raw_ptr = new Tensor(new_meta, this->_storage, this->_offset);
+    
+    return tensor_t(raw_ptr);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
