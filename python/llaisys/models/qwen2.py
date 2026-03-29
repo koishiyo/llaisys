@@ -1,16 +1,27 @@
 import json
 import ctypes
 import numpy as np
-import torch
-import torch.nn.functional as F
 import gc
 import platform
 import os
 from typing import Sequence, List
 from pathlib import Path
 from ..libllaisys import LIB_LLAISYS, DeviceType, LlaisysQwen2Meta
-# 声明返回值类型为 float 指针
+
+# ==========================================
+# 【核心修改】：精准定义与 C++ 交互的参数类型
+# ==========================================
+LIB_LLAISYS.llaisysQwen2ModelInfer.argtypes = [
+    ctypes.c_void_p,                # model handle
+    ctypes.POINTER(ctypes.c_int64), # token_ids
+    ctypes.c_size_t,                # ntoken
+    ctypes.c_float,                 # temperature
+    ctypes.c_float,                 # top_p
+    ctypes.c_size_t                 # top_k
+]
+LIB_LLAISYS.llaisysQwen2ModelInfer.restype = ctypes.c_int64
 LIB_LLAISYS.llaisysQwen2ModelGetLogits.restype = ctypes.POINTER(ctypes.c_float)
+
 try:
     from safetensors import safe_open
 except ImportError:
@@ -20,7 +31,6 @@ class Qwen2:
     def __init__(self, model_path: str, device: DeviceType = DeviceType.CPU):
         model_path = Path(model_path)
         
-        # 1. Config
         config_path = model_path / "config.json"
         if not config_path.exists():
             raise FileNotFoundError(f"Config not found at {config_path}")
@@ -28,7 +38,6 @@ class Qwen2:
         with open(config_path, "r") as f:
             cfg = json.load(f)
 
-        # 2. Meta
         self.meta = LlaisysQwen2Meta()
         self.meta.dtype = 0 
         self.meta.nlayer = cfg["num_hidden_layers"]
@@ -38,10 +47,6 @@ class Qwen2:
         self.meta.dh = self.meta.hs // self.meta.nh
         self.meta.di = cfg["intermediate_size"]
         
-        # === 【关键修改：针对 Windows CI 的内存优化】 ===
-        # 原始配置可能很大 (32k+)，导致 C++ 预分配超大内存。
-        # 我们在这里检测环境，如果是 Windows CI，强行把它砍小到 1024。
-        # 这能节省约 1GB+ 的内存，足以防止崩溃。
         raw_maxseq = cfg.get("max_position_embeddings", 4096)
         is_windows_ci = (platform.system() == "Windows" and os.environ.get("GITHUB_ACTIONS") == "true")
         
@@ -59,7 +64,6 @@ class Qwen2:
 
         print(f"[LLaisys] Init Qwen2: {self.meta.nlayer}L, {self.meta.hs}H, Context: {self.meta.maxseq}")
 
-        # 3. Create C++ Model
         self.handle = LIB_LLAISYS.llaisysQwen2ModelCreate(
             ctypes.byref(self.meta), 
             device.value, 
@@ -69,12 +73,12 @@ class Qwen2:
         if not self.handle: raise RuntimeError("Failed to create model")
         
         self.c_weights = LIB_LLAISYS.llaisysQwen2ModelWeights(self.handle).contents
-
-        # 4. Load Weights
         self._load_weights(model_path)
 
     def _load_weights(self, path):
-       
+       # 注意：虽然这里导入模型参数用了 PyTorch，但这不属于推理过程，
+       # 只是为了读取 .safetensors 权重。项目规则是“推理阶段不使用PyTorch”。
+        import torch 
         weight_files = sorted(list(path.glob("*.safetensors")))
         for f in weight_files:
             print(f"Loading {f.name}...")
@@ -82,23 +86,15 @@ class Qwen2:
                 for name in st.keys():
                     ptr = self._route(name)
                     if ptr:
-                        # Load
                         tensor = st.get_tensor(name)
                         tensor = tensor.to(torch.float32)
-                        
-                        # Numpy
                         data = tensor.numpy()
                         data = np.ascontiguousarray(data)
-                        
-                        # Copy
                         dst = LIB_LLAISYS.llaisysTensorData(ptr)
                         if dst: 
                             ctypes.memmove(dst, data.ctypes.data, data.nbytes)
-                        
-                        # Delete immediately
                         del tensor
                         del data
-            # File level GC
             gc.collect()
 
     def _route(self, name):
@@ -133,118 +129,55 @@ class Qwen2:
         if hasattr(self, 'handle') and self.handle:
             LIB_LLAISYS.llaisysQwen2ModelDestroy(self.handle)
 
-    def generate(self, inputs: Sequence[int], max_new_tokens=50, temperature=0.7, top_p=0.9, **kwargs) -> List[int]:
+    def generate(self, inputs: Sequence[int], max_new_tokens=50, temperature=0.7, top_p=0.9, top_k=50, **kwargs) -> List[int]:
         curr = list(inputs)
         
-        # Prefill 阶段 (处理完整的 Prompt)
+        c_temp = ctypes.c_float(temperature)
+        c_top_p = ctypes.c_float(top_p)
+        c_top_k = ctypes.c_size_t(top_k)
+
+        # Prefill 阶段
         seq_len = len(curr)
         arr = (ctypes.c_int64 * seq_len)(*curr)
         
-        # 调用 infer 进行推理，但我们不再强制使用它返回的 next_tok (那是 argmax 的结果)
-        LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, arr, seq_len)
+        next_tok = LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, arr, seq_len, c_temp, c_top_p, c_top_k)
         
-        # Decode 阶段 (逐字生成)
         for _ in range(max_new_tokens):
-            # 1. 从 C++ 获取 Logits 指针
-            logits_ptr = LIB_LLAISYS.llaisysQwen2ModelGetLogits(self.handle)
+            # 🚀 【核心修复】：先存进去！不管是不是结束符，都得保证它在列表里
+            curr.append(next_tok)
             
-            # 2. 将 C 数组转化为 PyTorch Tensor (零拷贝，非常快)
-            # self.meta.voc 是词表大小 (151643)
-            logits_array = np.ctypeslib.as_array(logits_ptr, shape=(self.meta.voc,))
-            logits = torch.from_numpy(logits_array).float()
-            
-            # 3. 采样算法开始 ============================
-            # (1) 应用 Temperature
-            if temperature > 0.0 and temperature != 1.0:
-                logits = logits / temperature
-            
-            # (2) 转化为概率分布 (Softmax)
-            probs = F.softmax(logits, dim=-1)
-            
-            # (3) Top-P (Nucleus Sampling) 核心逻辑
-            if top_p > 0.0 and top_p < 1.0:
-                # 按概率从大到小排序
-                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                # 计算累积概率
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            # 🚀 然后再判断要不要跳出循环
+            if next_tok == self.meta.end_token or next_tok == 151645: 
+                break
                 
-                # 找到累积概率超过 top_p 的位置，将它们及之后的概率置为 0
-                # 比如我们要保留 90% 的概率质量，把剩下 10% 那些长尾的生僻词砍掉
-                sorted_indices_to_remove = cumulative_probs > top_p
-                # 保留至少一个词，防止全部被截断
-                sorted_indices_to_remove[0] = False 
-                
-                # 把不需要的词的概率设为 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                probs[indices_to_remove] = 0.0
-                
-                # 重新归一化 (让剩下的概率加起来等于 1)
-                probs = probs / probs.sum()
+            # Decode 阶段：每次只传1个长度，返回下1个
+            arr = (ctypes.c_int64 * 1)(next_tok)
+            next_tok = LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, arr, 1, c_temp, c_top_p, c_top_k)
             
-            # (4) 根据最终的概率分布进行掷骰子 (多项式采样)
-            if temperature == 0.0:
-                # 如果 temperature 为 0，退化为原版的 Argmax
-                next_tok = torch.argmax(probs).item()
-            else:
-                next_tok = torch.multinomial(probs, num_samples=1).item()
-            # ============================================
+        return curr
 
-            # 4. 检查是否生成结束 (EOS token)
-            if next_tok == self.meta.end_token: 
+    def stream_generate(self, inputs: Sequence[int], max_new_tokens=400, temperature=0.7, top_p=0.9, top_k=50, **kwargs):
+        """流式生成器：极其简洁，因为重活都交给 C++ 的 sampler 了！"""
+        curr = list(inputs)
+        
+        c_temp = ctypes.c_float(temperature)
+        c_top_p = ctypes.c_float(top_p)
+        c_top_k = ctypes.c_size_t(top_k)
+
+        # Prefill 阶段：喂给 C++ 整个问题，得到第一个回答的 Token
+        seq_len = len(curr)
+        arr = (ctypes.c_int64 * seq_len)(*curr)
+        next_tok = LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, arr, seq_len, c_temp, c_top_p, c_top_k)
+        
+        # 持续生成
+        for _ in range(max_new_tokens):
+            yield next_tok
+            
+            if next_tok == self.meta.end_token or next_tok == 151645: 
                 break
                 
             curr.append(next_tok)
             
-            # 5. 将新生成的 Token 喂给模型，准备预测下一个
+            # Decode 阶段：把刚生成的词喂给 C++，换取下一个词
             arr = (ctypes.c_int64 * 1)(next_tok)
-            LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, arr, 1)
-            
-        return curr
-    def stream_generate(self, inputs: Sequence[int], max_new_tokens=400, temperature=0.7, top_p=0.9, **kwargs):
-        """流式生成器：算出一个词就往外吐一个词！"""
-        curr = list(inputs)
-        
-        # Prefill 阶段 (处理完整的 Prompt)
-        seq_len = len(curr)
-        arr = (ctypes.c_int64 * seq_len)(*curr)
-        
-        # 一次性把 Prompt 喂给引擎，算出第一个字的 Logits
-        LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, arr, seq_len)
-        
-        # Decode 阶段 (逐字生成)
-        for _ in range(max_new_tokens):
-            # 1. 从 C++ 获取 Logits 指针并转为 Tensor
-            logits_ptr = LIB_LLAISYS.llaisysQwen2ModelGetLogits(self.handle)
-            logits_array = np.ctypeslib.as_array(logits_ptr, shape=(self.meta.voc,))
-            logits = torch.from_numpy(logits_array).float()
-            
-            # 2. 完美复用你写的采样算法 ============================
-            if temperature > 0.0 and temperature != 1.0:
-                logits = logits / temperature
-            probs = F.softmax(logits, dim=-1)
-            
-            if top_p > 0.0 and top_p < 1.0:
-                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[0] = False 
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                probs[indices_to_remove] = 0.0
-                probs = probs / probs.sum()
-            
-            if temperature == 0.0:
-                next_tok = torch.argmax(probs).item()
-            else:
-                next_tok = torch.multinomial(probs, num_samples=1).item()
-            # ========================================================
-
-            # 3. 🚨 极其关键：算出一个词，立刻抛给外面的 chat.py！
-            yield next_tok
-            
-            # 4. 检查是否生成结束 (遇到了普通的 EOS 或者 Qwen 的对话结束符 <|im_end|>)
-            if next_tok == self.meta.end_token or next_tok == 151645: 
-                break
-                
-            # 5. 将新生成的 Token 喂给模型，准备预测下一个
-            arr = (ctypes.c_int64 * 1)(next_tok)
-            LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, arr, 1)    
+            next_tok = LIB_LLAISYS.llaisysQwen2ModelInfer(self.handle, arr, 1, c_temp, c_top_p, c_top_k)

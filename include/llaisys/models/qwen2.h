@@ -55,7 +55,7 @@ __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model *model);
 
 __export LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model *model);
 
-__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken);
+__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken, float temperature, float top_p, size_t top_k);
 
 #ifdef __cplusplus
 }

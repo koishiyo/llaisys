@@ -10,6 +10,8 @@
 #include "../ops/self_attention/op.hpp"
 #include "../ops/swiglu/op.hpp"
 #include "../ops/add/op.hpp"
+// 【新增】：引入采样器算子！
+#include "../ops/sampler/cpu/sampler_cpu.hpp"
 
 #include <vector>
 #include <cstring>
@@ -38,7 +40,6 @@ public:
     tensor_t buf_hidden, buf_residual;
     
     // QKV 相关 Buffer
-    // 改动：这些 buffer 基础形状将是 2D [MaxSeq, Dim]
     tensor_t buf_q, buf_k, buf_v;
     tensor_t buf_att_out; 
     
@@ -127,8 +128,6 @@ private:
 
     void init_buffers() {
         size_t s = meta.maxseq;
-        // 修正：QKV 初始 Buffer 设为 2D [MaxSeq, TotalDim]
-        // 这样在 Linear 时可以直接切片使用，避免维度错误
         size_t dim_q = meta.nh * meta.dh;
         size_t dim_kv = meta.nkvh * meta.dh;
 
@@ -137,11 +136,11 @@ private:
         buf_hidden    = create_b({s, meta.hs});
         buf_residual  = create_b({s, meta.hs});
 
-        buf_q = create_b({s, dim_q});  // 2D
-        buf_k = create_b({s, dim_kv}); // 2D
-        buf_v = create_b({s, dim_kv}); // 2D
+        buf_q = create_b({s, dim_q});  
+        buf_k = create_b({s, dim_kv}); 
+        buf_v = create_b({s, dim_kv}); 
         
-        buf_att_out   = create_b({s, dim_q}); // 2D，SelfAttn 输出通常是 [seq, nh, dh]，但这里作为buffer先按总大小申请，使用时reshape
+        buf_att_out   = create_b({s, dim_q}); 
         buf_att_proj  = create_b({s, meta.hs});
         
         buf_gate      = create_b({s, meta.di});
@@ -154,23 +153,22 @@ private:
     }
 
 public:
-    int64_t infer(int64_t* token_ids, size_t ntoken) {
+    // 【修改】：接收采样超参数 temperature, top_p, top_k
+    int64_t infer(int64_t* token_ids, size_t ntoken, float temperature, float top_p, size_t top_k) {
         size_t seq_len = ntoken;
         size_t start_pos = this->current_pos;
         size_t total_len = start_pos + seq_len;
 
-        // === Step 1: Slice Views (获取当前步的视图) ===
-        // 注意：这里拿到的 cur_q/k/v 都是 2D [seq, dim]
+        // === Step 1: Slice Views ===
         tensor_t cur_input_ids = buf_input_ids->slice(0, 0, seq_len);
         tensor_t cur_pos_ids   = buf_pos_ids->slice(0, 0, seq_len);
         tensor_t cur_hidden    = buf_hidden->slice(0, 0, seq_len);
         tensor_t cur_residual  = buf_residual->slice(0, 0, seq_len);
 
-        tensor_t cur_q = buf_q->slice(0, 0, seq_len); // [seq, nh*dh] (2D)
-        tensor_t cur_k = buf_k->slice(0, 0, seq_len); // [seq, nkvh*dh] (2D)
-        tensor_t cur_v = buf_v->slice(0, 0, seq_len); // [seq, nkvh*dh] (2D)
+        tensor_t cur_q = buf_q->slice(0, 0, seq_len); 
+        tensor_t cur_k = buf_k->slice(0, 0, seq_len); 
+        tensor_t cur_v = buf_v->slice(0, 0, seq_len); 
         
-        // Attn Out 基础视图是 2D [seq, nh*dh]
         tensor_t cur_att_out_flat = buf_att_out->slice(0, 0, seq_len); 
         tensor_t cur_att_proj     = buf_att_proj->slice(0, 0, seq_len);
 
@@ -180,37 +178,28 @@ public:
         tensor_t cur_down      = buf_down->slice(0, 0, seq_len);
 
         // === Step 2: Inference Loop ===
-
-        // Inputs
         std::memcpy(cur_input_ids->data(), token_ids, seq_len * sizeof(int64_t));
         int64_t* pos_ptr = (int64_t*)cur_pos_ids->data();
         for (size_t i = 0; i < seq_len; ++i) pos_ptr[i] = start_pos + i;
 
-        // Embedding
         ops::embedding(cur_hidden, cur_input_ids, unwrap(weights.in_embed));
 
         for (size_t i = 0; i < meta.nlayer; i++) {
-            // --- Attention Block ---
             size_t bytes_hidden = cur_hidden->numel() * sizeof(float);
             std::memcpy(cur_residual->data(), cur_hidden->data(), bytes_hidden);
             
-            // Pre-Norm
             ops::rms_norm(cur_hidden, cur_hidden, unwrap(weights.attn_norm_w[i]), meta.epsilon);
             
-            // Linear Projections (QKV)
-            // 这里传入的是 2D 张量，符合 Linear 要求
             ops::linear(cur_q, cur_hidden, unwrap(weights.attn_q_w[i]), unwrap(weights.attn_q_b[i]));
             ops::linear(cur_k, cur_hidden, unwrap(weights.attn_k_w[i]), unwrap(weights.attn_k_b[i]));
             ops::linear(cur_v, cur_hidden, unwrap(weights.attn_v_w[i]), unwrap(weights.attn_v_b[i]));
             
-            // RoPE 准备：将 2D 视图 Reshape 成 3D [seq, n_head, head_dim]
             tensor_t q_3d = cur_q->reshape({seq_len, meta.nh, meta.dh});
             tensor_t k_3d = cur_k->reshape({seq_len, meta.nkvh, meta.dh});
             
             ops::rope(q_3d, q_3d, cur_pos_ids, meta.theta);
             ops::rope(k_3d, k_3d, cur_pos_ids, meta.theta);
             
-            // KV Cache Update
             tensor_t kc = k_cache[i];
             tensor_t vc = v_cache[i];
             size_t bytes_copy = seq_len * meta.nkvh * meta.dh * sizeof(float);
@@ -218,28 +207,17 @@ public:
             std::memcpy(kc->data() + offset, cur_k->data(), bytes_copy);
             std::memcpy(vc->data() + offset, cur_v->data(), bytes_copy);
             
-            // Self Attention
-            // 构造 Cache 的 3D 视图 [total_len, nkvh, dh]
             tensor_t kc_view = kc->slice(0, 0, total_len)->reshape({total_len, meta.nkvh, meta.dh});
             tensor_t vc_view = vc->slice(0, 0, total_len)->reshape({total_len, meta.nkvh, meta.dh});
-            
-            // 构造 Output 的 3D 视图 [seq, nh, dh]
             tensor_t att_out_3d = cur_att_out_flat->reshape({seq_len, meta.nh, meta.dh});
-            
-            // 注意：V 的 reshape 视图在 RoPE 阶段没用到，这里重新创建 view
-            tensor_t v_3d = cur_v->reshape({seq_len, meta.nkvh, meta.dh}); // 其实 Attention 算子可能没用到这个 current v，而是用的 cache
+            tensor_t v_3d = cur_v->reshape({seq_len, meta.nkvh, meta.dh}); 
             
             float scale = 1.0f / std::sqrt((float)meta.dh);
-            // Self Attention 计算：输出写到 att_out_3d
             ops::self_attention(att_out_3d, q_3d, kc_view, vc_view, scale);
             
-            // Output Projection
-            // 此时 cur_att_out_flat 里的数据已经是计算好的了 (att_out_3d 共享内存)
-            // 直接作为 Linear 输入 (2D)
             ops::linear(cur_att_proj, cur_att_out_flat, unwrap(weights.attn_o_w[i]), nullptr);
             ops::add(cur_hidden, cur_att_proj, cur_residual);
             
-            // --- FFN Block ---
             std::memcpy(cur_residual->data(), cur_hidden->data(), bytes_hidden);
             
             ops::rms_norm(cur_hidden, cur_hidden, unwrap(weights.mlp_norm_w[i]), meta.epsilon);
@@ -252,25 +230,17 @@ public:
             ops::add(cur_hidden, cur_down, cur_residual);
         }
 
-        // Final Norm
         ops::rms_norm(cur_hidden, cur_hidden, unwrap(weights.out_norm_w), meta.epsilon);
         
-        // Head
         std::byte* last_row = cur_hidden->data() + (seq_len - 1) * meta.hs * sizeof(float);
         std::memcpy(buf_last_hidden->data(), last_row, meta.hs * sizeof(float));
-        
         ops::linear(buf_logits, buf_last_hidden, unwrap(weights.out_embed), nullptr);
 
-        // Argmax
+        // ==========================================
+        // 【核心修改】：删除了 Argmax，调用强大的 Sampler
+        // ==========================================
         float* logits = (float*)buf_logits->data();
-        float max_val = -1e30f;
-        int64_t next_token = 0;
-        for (size_t i = 0; i < meta.voc; ++i) {
-            if (logits[i] > max_val) {
-                max_val = logits[i];
-                next_token = i;
-            }
-        }
+        int64_t next_token = ops::cpu::sample(logits, meta.voc, temperature, top_p, top_k);
 
         this->current_pos += seq_len;
         return next_token;
@@ -288,9 +258,10 @@ __export LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model 
     if (!model) return nullptr;
     return &((Qwen2Impl*)model)->weights;
 }
-__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken) {
+// 【修改】：C-API 签名增加采样参数
+__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, float temperature, float top_p, size_t top_k) {
     if (!model) return -1;
-    return ((Qwen2Impl*)model)->infer(token_ids, ntoken);
+    return ((Qwen2Impl*)model)->infer(token_ids, ntoken, temperature, top_p, top_k);
 }
 __export void* llaisysTensorData(void* t) {
     if (!t) return nullptr;
@@ -298,7 +269,6 @@ __export void* llaisysTensorData(void* t) {
 }
 __export float* llaisysQwen2ModelGetLogits(struct LlaisysQwen2Model * model) {
     if (!model) return nullptr;
-    // 返回 logits buffer 的数据指针
     return (float*)((Qwen2Impl*)model)->buf_logits->data();
 }
 }

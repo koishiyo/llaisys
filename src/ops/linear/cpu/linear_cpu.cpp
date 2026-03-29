@@ -9,17 +9,27 @@ template <typename T>
 void linear_kernel(const T *input, const T *weight, const T *bias, T *out,
                    size_t M, size_t K, size_t N) {
     if constexpr (std::is_same_v<T, float>) {
-        // 🚀 【F32 狂飙模式】：交给 OpenBLAS 降维打击
         const float* f_input = (const float*)input;
         const float* f_weight = (const float*)weight;
         float* f_out = (float*)out;
 
-        cblas_sgemm(
-            CblasRowMajor, CblasNoTrans, CblasTrans,
-            M, N, K, 1.0f,
-            f_input, K, f_weight, K,
-            0.0f, f_out, N
-        );
+        if (M == 1) {
+            // 🚀【新增】：Decode 阶段的绝对王者！
+            // 当 M=1 时，输入其实是一个向量。我们调用专门的 cblas_sgemv！
+            // Weight 是 N 行 K 列，Input 是长度为 K 的向量，Output 是长度为 N 的向量。
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, 
+                        N, K, 1.0f, 
+                        f_weight, K, 
+                        f_input, 1, 
+                        0.0f, 
+                        f_out, 1);
+        } else {
+            // 🚀 Prefill 阶段：保持原样，大矩阵对撞
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        M, N, K, 1.0f,
+                        f_input, K, f_weight, K,
+                        0.0f, f_out, N);
+        }
 
         // 加上偏置
         if (bias != nullptr) {
@@ -33,9 +43,20 @@ void linear_kernel(const T *input, const T *weight, const T *bias, T *out,
     } 
     // 🚨 绝对安全版：剥离 OpenMP，彻底杜绝线程死锁！
     else if constexpr (std::is_same_v<T, llaisys::fp16_t> || std::is_same_v<T, llaisys::bf16_t>) {
-        std::vector<float> f32_x(M * K);
-        std::vector<float> f32_w(N * K);
-        std::vector<float> f32_out(M * N);
+        
+        // ==========================================
+        // 🚀【核心优化】：引入静态线程缓存 (Workspace)
+        // thread_local 保证了这三块内存只会在第一次调用时被申请，
+        // 之后成千上万次的循环都会直接复用这块物理内存！绝对的零开销！
+        // ==========================================
+        thread_local std::vector<float> f32_x;
+        thread_local std::vector<float> f32_w;
+        thread_local std::vector<float> f32_out;
+
+        // resize 在预留空间足够大时，几乎不消耗任何时间
+        f32_x.resize(M * K);
+        f32_w.resize(N * K);
+        f32_out.resize(M * N);
 
         // 1. 单线程安全强转（CPU 跑这点 for 循环极快）
         for (size_t i = 0; i < M * K; i++) {
