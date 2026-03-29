@@ -1,6 +1,10 @@
 add_rules("mode.debug", "mode.release")
 set_encodings("utf-8")
-
+add_requires("openmp")
+-- 终极暴力：直接把 Ubuntu 存放 OpenBLAS 的所有老巢硬塞给编译器！
+add_includedirs("include", "/usr/include/openblas", "/usr/include/x86_64-linux-gnu")
+-- 强制指定系统库的搜索目录
+add_linkdirs("/usr/lib/x86_64-linux-gnu")
 add_includedirs("include")
 
 -- CPU --
@@ -83,7 +87,7 @@ target_end()
 target("llaisys-ops")
     set_kind("static")
     add_deps("llaisys-ops-cpu")
-
+    add_packages("openmp")
     set_languages("cxx17")
     set_warnings("all", "error")
     if not is_plat("windows") then
@@ -102,6 +106,11 @@ target("llaisys")
     add_deps("llaisys-core")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
+    add_packages("openmp")
+
+    add_ldflags("-fopenmp", "/usr/lib/x86_64-linux-gnu/libopenblas.so", {force = true})
+    add_cxflags("-fopenmp", {force = true})
+
     add_files("src/llaisys/*.cpp")
     
     set_languages("cxx17")

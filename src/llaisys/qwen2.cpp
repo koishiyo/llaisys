@@ -296,4 +296,9 @@ __export void* llaisysTensorData(void* t) {
     if (!t) return nullptr;
     return ((LlaisysTensor*)t)->tensor->data();
 }
+__export float* llaisysQwen2ModelGetLogits(struct LlaisysQwen2Model * model) {
+    if (!model) return nullptr;
+    // 返回 logits buffer 的数据指针
+    return (float*)((Qwen2Impl*)model)->buf_logits->data();
+}
 }

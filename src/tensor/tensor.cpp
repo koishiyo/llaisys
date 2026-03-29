@@ -234,7 +234,7 @@ tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
 
     // 检查切片范围是否合法
     size_t dim_size = this->shape()[dim];
-    if (start >= end) {
+    if (start > end) {
         throw std::runtime_error("Slice start must be less than end");
     }
     if (end > dim_size) {

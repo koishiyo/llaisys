@@ -30,7 +30,11 @@ def load_shared_library():
 
     if not os.path.isfile(lib_path):
         raise FileNotFoundError(f"Shared library not found: {lib_path}")
-
+    # 👇👇👇 在 return 之前，加上这两行终极黑魔法 👇👇👇
+    import ctypes
+    # 告诉操作系统：提前把 OpenBLAS 加载到全局内存里！
+    ctypes.CDLL("libopenblas.so.0", mode=ctypes.RTLD_GLOBAL)
+    
     return ctypes.CDLL(str(lib_path))
 
 
